@@ -8,7 +8,7 @@ import pandas as pd
 from bsky_bridge import BskySession
 from bsky_bridge import post_image
 
-data_url = "google_spreadsheet_url_ending_csv"
+data_url = os.environ.get("SHEET_CSV_URL")
 
 # column names, matched exactly as they appear in the sheet header
 COL_FILM = "Film"
@@ -39,13 +39,32 @@ def drive_share_link_to_direct_url(share_link):
     return "http://drive.google.com/uc?export=view&id=" + file_id
 
 
-def build_caption(row):
+def ordinal_day(day):
+    if 11 <= day % 100 <= 13:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def parse_ticket_date(item):
+    try:
+        return pd.to_datetime(item[COL_DATE], format="%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None  # unparseable date
+
+
+def build_caption(row, ticket_date):
     parts = []
     for col in CAPTION_COLUMNS:
+        if col == COL_DATE:
+            formatted_date = f"{ordinal_day(ticket_date.day)} {ticket_date.strftime('%b %Y')}"
+            parts.append(formatted_date)
+            continue
         value = row.get(col)
         if isinstance(value, str) and value.strip():
             parts.append(value.strip())
-    return " — ".join(parts)
+    return ", ".join(parts)
 
 
 def is_usable_row(item):
@@ -55,29 +74,27 @@ def is_usable_row(item):
     return True
 
 
-def matches_today(item, today):
-    try:
-        ticket_date = pd.to_datetime(item[COL_DATE], format="%Y-%m-%d").date()
-    except (ValueError, TypeError):
-        return False  # skip rows with a date we can't parse
-    return ticket_date.month == today.month and ticket_date.day == today.day
-
-
 def handler(pdm: "pipedream"):
-    bsky_session = BskySession(os.environ.get("BSKY_USER"), os.environ.get("BSKY_PASS"))
+    bsky_session = BskySession(os.environ.get("BSKY_USER"), os.environ.get("BSKY_PASS"),
+                                session_dir="/tmp/.bsky_sessions")
 
     csv = requests.get(data_url, timeout=30).content
     df = pd.read_csv(io.StringIO(csv.decode('utf-8')))
 
     today = date.today()
-    matches = [item for item in df.to_dict(orient='records')
-               if is_usable_row(item) and matches_today(item, today)]
+    matches = []
+    for item in df.to_dict(orient='records'):
+        if not is_usable_row(item):
+            continue
+        ticket_date = parse_ticket_date(item)
+        if ticket_date and ticket_date.month == today.month and ticket_date.day == today.day:
+            matches.append((item, ticket_date))
 
     if not matches:
         return {"posted": 0, "message": "No tickets match today's date."}
 
     posted, errors = [], []
-    for i, item in enumerate(matches):
+    for i, (item, ticket_date) in enumerate(matches):
         film = item.get(COL_FILM, f"row {i}")
         try:
             image_url = drive_share_link_to_direct_url(item[COL_IMAGE])
@@ -86,10 +103,13 @@ def handler(pdm: "pipedream"):
             with open(filename, "wb") as f:
                 f.write(image_bytes)
 
-            post_image(bsky_session, build_caption(item), filename, item[COL_ALT_TEXT])
+            post_image(bsky_session, build_caption(item, ticket_date), filename, item[COL_ALT_TEXT])
             posted.append(film)
         except Exception as e:
             # one bad ticket (dead link, network blip) shouldn't stop the rest
             errors.append({"film": film, "error": str(e)})
+
+    if errors:
+        print("Some tickets failed to post:", errors)
 
     return {"posted": len(posted), "films": posted, "errors": errors}
